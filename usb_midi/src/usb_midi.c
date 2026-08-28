@@ -1,7 +1,9 @@
 #include <zephyr/init.h>
+#include <zephyr/spinlock.h>
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/usb/usbd.h>
 #include <zephyr/drivers/usb/udc.h>
+#include <string.h>
 #include <usb_midi/usb_midi.h>
 #include "usb_midi_types.h"
 #include "usb_midi_macros.h"
@@ -83,7 +85,9 @@ static struct usb_desc_header nil_desc = {
 struct usb_midi_data {
 	// fifo used to enqueue 4 byte USB MIDI packets to send at the next SOF event
 	struct ring_buf tx_fifo;
+	struct k_spinlock tx_lock;
 	int has_pending_tx_buffer;
+	uint32_t pending_tx_len;
 	int is_available;
 	struct usb_midi_config* config;
 	const struct usb_desc_header **const fs_desc;
@@ -131,9 +135,12 @@ const static struct usb_desc_header *hs_interface_descriptors[] = {
 #endif
 
 static uint8_t tx_fifo_data[CONFIG_USB_MIDI_TX_FIFO_SIZE];
+BUILD_ASSERT((CONFIG_USB_MIDI_TX_FIFO_SIZE % 4) == 0,
+	     "CONFIG_USB_MIDI_TX_FIFO_SIZE must be a multiple of 4");
 static struct usb_midi_data usb_midi_class_data = {
 	.tx_fifo = {.buffer = tx_fifo_data, .size = CONFIG_USB_MIDI_TX_FIFO_SIZE},
 	.has_pending_tx_buffer = 0,
+	.pending_tx_len = 0,
 	.is_available = 0,
 	.config = &usb_midi_config_data,
 	.fs_desc = interface_descriptors,
@@ -232,32 +239,92 @@ static void usb_midi_availability_changed(int is_available)
 #endif
 }
 
+static void tx_abort_pending(struct usb_midi_data *data)
+{
+	k_spinlock_key_t key = k_spin_lock(&data->tx_lock);
+	int finish_result = 0;
+
+	if (data->pending_tx_len > 0) {
+		finish_result = ring_buf_get_finish(&data->tx_fifo, 0);
+	}
+
+	data->has_pending_tx_buffer = 0;
+	data->pending_tx_len = 0;
+	k_spin_unlock(&data->tx_lock, key);
+
+	if (finish_result != 0) {
+		LOG_ERR("Failed to release pending tx FIFO data, error %d", finish_result);
+	}
+}
+
+static void tx_complete_pending(struct usb_midi_data *data)
+{
+	k_spinlock_key_t key = k_spin_lock(&data->tx_lock);
+	uint32_t pending_len = data->pending_tx_len;
+	int finish_result = 0;
+
+	if (pending_len > 0) {
+		finish_result = ring_buf_get_finish(&data->tx_fifo, pending_len);
+	}
+
+	data->has_pending_tx_buffer = 0;
+	data->pending_tx_len = 0;
+	k_spin_unlock(&data->tx_lock, key);
+
+	if (finish_result != 0) {
+		LOG_ERR("Failed to finish pending tx FIFO data, error %d", finish_result);
+	}
+}
+
+static int tx_try_claim_pending(struct usb_midi_data *data)
+{
+	k_spinlock_key_t key = k_spin_lock(&data->tx_lock);
+	int claimed = 0;
+
+	if (data->is_available && !data->has_pending_tx_buffer &&
+	    !ring_buf_is_empty(&data->tx_fifo)) {
+		data->has_pending_tx_buffer = 1;
+		claimed = 1;
+	}
+
+	k_spin_unlock(&data->tx_lock, key);
+
+	return claimed;
+}
+
 enum usb_midi_error_t usb_midi_tx(uint8_t cable_number, uint8_t *midi_bytes)
 {
 	struct usb_midi_data *data = &usb_midi_class_data;
-
-	if (!data->is_available) {
-		return USB_MIDI_NOT_AVAILABLE;
-	}
-
-	if (ring_buf_space_get(&data->tx_fifo) < 4) {
-		LOG_WRN("tx fifo is full");
-		return USB_MIDI_TX_FIFO_FULL;
-	}
-
 	struct usb_midi_packet_t packet;
 	enum usb_midi_packet_error_t error =
 		usb_midi_packet_from_midi_bytes(midi_bytes, cable_number, &packet);
+	int put_result;
+
 	if (error != USB_MIDI_PACKET_SUCCESS) {
 		LOG_ERR("Building tx packet from MIDI bytes %02x %02x %02x failed with error %d",
 			midi_bytes[0], midi_bytes[1], midi_bytes[2], error);
 		return USB_MIDI_INVALID_DATA;
 	}
-	LOG_DBG_PACKET(packet);
 
-	int put_result = ring_buf_put(&data->tx_fifo, packet.bytes, 4);
+	k_spinlock_key_t key = k_spin_lock(&data->tx_lock);
+	if (!data->is_available) {
+		k_spin_unlock(&data->tx_lock, key);
+		return USB_MIDI_NOT_AVAILABLE;
+	}
+
+	if (ring_buf_space_get(&data->tx_fifo) < 4) {
+		k_spin_unlock(&data->tx_lock, key);
+		LOG_WRN("tx fifo is full");
+		return USB_MIDI_TX_FIFO_FULL;
+	}
+
+	put_result = ring_buf_put(&data->tx_fifo, packet.bytes, 4);
+	k_spin_unlock(&data->tx_lock, key);
+
+	LOG_DBG_PACKET(packet);
 	if (put_result != 4) {
 		LOG_ERR("No room for USB MIDI packet in tx FIFO, put result %d", put_result);
+		return USB_MIDI_TX_FIFO_FULL;
 	}
 
 	return USB_MIDI_SUCCESS;
@@ -270,7 +337,7 @@ int debug_tx_ep_buf_balance = 0;
 static int enqueue_next_tx_buf(struct usbd_class_data *const c_data)
 {
 	struct usb_midi_data *data = usbd_class_get_private(c_data);
-	if (ring_buf_is_empty(&data->tx_fifo)) {
+	if (!tx_try_claim_pending(data)) {
 		return 0;
 	}
 
@@ -279,20 +346,54 @@ static int enqueue_next_tx_buf(struct usbd_class_data *const c_data)
 		usbd_ep_buf_alloc(c_data, usb_midi_bulk_in_ep_addr(c_data), USBD_MAX_BULK_MPS);
 	if (buf == NULL) {
 		LOG_ERR("Failed to allocate tx ep buf, balance %d", debug_tx_ep_buf_balance);
+		tx_abort_pending(data);
 		return 0;
 	}
 	debug_tx_ep_buf_balance++;
 
-	// Read fifo data into the endpoint buffer. Don't read
-	// more than we can fit into the buffer.
+	// Claim FIFO data but only finish it after the endpoint transfer completes.
+	k_spinlock_key_t key = k_spin_lock(&data->tx_lock);
+	if (!data->is_available || ring_buf_is_empty(&data->tx_fifo)) {
+		data->has_pending_tx_buffer = 0;
+		data->pending_tx_len = 0;
+		k_spin_unlock(&data->tx_lock, key);
+		usbd_ep_buf_free(c_data->uds_ctx, buf);
+		debug_tx_ep_buf_balance--;
+		return 0;
+	}
+
 	int num_bytes_in_fifo = ring_buf_size_get(&data->tx_fifo);
 	__ASSERT_NO_MSG(num_bytes_in_fifo % 4 == 0);
 	__ASSERT_NO_MSG(buf->size % 4 == 0);
 	int num_bytes_to_add = num_bytes_in_fifo > buf->size ? buf->size : num_bytes_in_fifo;
-	int num_bytes_read = ring_buf_get(&data->tx_fifo, buf->data, num_bytes_to_add);
+	uint8_t *tx_data;
+	int num_bytes_read = ring_buf_get_claim(&data->tx_fifo, &tx_data, num_bytes_to_add);
+	if (num_bytes_read > 0) {
+		memcpy(buf->data, tx_data, num_bytes_read);
+	}
+	data->pending_tx_len = num_bytes_read;
+	k_spin_unlock(&data->tx_lock, key);
+
+	if (num_bytes_read == 0) {
+		LOG_ERR("Expected to claim tx FIFO data, claimed 0 bytes");
+		usbd_ep_buf_free(c_data->uds_ctx, buf);
+		debug_tx_ep_buf_balance--;
+		tx_abort_pending(data);
+		return 0;
+	}
+
+	if ((num_bytes_read % 4) != 0) {
+		LOG_ERR("tx FIFO claim length %d is not USB MIDI packet aligned", num_bytes_read);
+		usbd_ep_buf_free(c_data->uds_ctx, buf);
+		debug_tx_ep_buf_balance--;
+		tx_abort_pending(data);
+		return 0;
+	}
+
 	buf->len = num_bytes_read;
 	if (num_bytes_read != num_bytes_to_add) {
-		LOG_ERR("Expected to read %d bytes from tx fifo, read %d", num_bytes_to_add,
+		LOG_DBG("tx FIFO claim limited to contiguous span: requested %d bytes, claimed %d",
+			num_bytes_to_add,
 			num_bytes_read);
 	}
 
@@ -301,6 +402,8 @@ static int enqueue_next_tx_buf(struct usbd_class_data *const c_data)
 		// something else went wrong. free tx buffer. this shouldn't happen.
 		LOG_ERR("usbd_ep_enqueue failed with error %d", enqueue_result);
 		usbd_ep_buf_free(c_data->uds_ctx, buf);
+		debug_tx_ep_buf_balance--;
+		tx_abort_pending(data);
 	} else {
 		return 1;
 	}
@@ -326,13 +429,20 @@ int usb_midi_request_cb(struct usbd_class_data *const c_data, struct net_buf *bu
 	struct usb_midi_data *data = usbd_class_get_private(c_data);
 	struct usbd_context *uds_ctx = usbd_class_get_ctx(c_data);
 	struct udc_buf_info *bi = NULL;
+	k_spinlock_key_t key;
 	bi = (struct udc_buf_info *)net_buf_user_data(buf);
 	LOG_DBG("%p -> ep 0x%02x, len %u, err %d", c_data, bi->ep, buf->len, err);
 
 	if (err) {
+		uint32_t completed_len = buf->len;
+		bool is_in_ep = USB_EP_DIR_IS_IN(bi->ep);
 		int ep_free_result = usbd_ep_buf_free(uds_ctx, buf);
+		if (is_in_ep) {
+			debug_tx_ep_buf_balance--;
+			tx_abort_pending(data);
+		}
 		LOG_ERR("usb_midi_request_cb, err %d, buf %p, buf len %d, free result %d", err, buf,
-			buf->len, ep_free_result);
+			completed_len, ep_free_result);
 	} else if (USB_EP_DIR_IS_OUT(bi->ep)) {
 		// Received data.
 		if (buf->len % 4 != 0) {
@@ -372,20 +482,24 @@ int usb_midi_request_cb(struct usbd_class_data *const c_data, struct net_buf *bu
 		}
 
 	} else {
-		struct usb_midi_data *data = usbd_class_get_private(c_data);
-
 		// sent data to host. free the buffer...
 		int ep_free_result = usbd_ep_buf_free(uds_ctx, buf);
 		if (ep_free_result != 0) {
 			LOG_WRN("ep_free_result failed with error %d", ep_free_result);
 		}
 		debug_tx_ep_buf_balance--;
+		// MCUX IP3511 reports buf->len as residual length here, so finish the saved claim.
+		tx_complete_pending(data);
+
 		// ...and enqueue next tx endpoint buffer if there is data in the tx FIFO
-		data->has_pending_tx_buffer = enqueue_next_tx_buf(c_data);
+		enqueue_next_tx_buf(c_data);
 
 		// If there is enough room in the tx fifo, signal that more data may be added.
-		if (user_callbacks.tx_done_cb &&
-		    ring_buf_space_get(&data->tx_fifo) <= CONFIG_USB_MIDI_TX_FIFO_WATER_MARK) {
+		key = k_spin_lock(&data->tx_lock);
+		int tx_fifo_space = ring_buf_space_get(&data->tx_fifo);
+		k_spin_unlock(&data->tx_lock, key);
+
+		if (user_callbacks.tx_done_cb && tx_fifo_space <= CONFIG_USB_MIDI_TX_FIFO_WATER_MARK) {
 			user_callbacks.tx_done_cb();
 		}
 	}
@@ -408,18 +522,21 @@ void usb_midi_resumed_cb(struct usbd_class_data *const c_data)
 /** Start of Frame */
 void usb_midi_sof_cb(struct usbd_class_data *const c_data)
 {
-	struct usb_midi_data *data = usbd_class_get_private(c_data);
-	if (!data->has_pending_tx_buffer) {
-		data->has_pending_tx_buffer = enqueue_next_tx_buf(c_data);
-	}
+	enqueue_next_tx_buf(c_data);
 }
 
 /** Class associated configuration is selected */
 void usb_midi_enable_cb(struct usbd_class_data *const c_data)
 {
 	struct usb_midi_data *data = usbd_class_get_private(c_data);
+
+	k_spinlock_key_t key = k_spin_lock(&data->tx_lock);
 	ring_buf_reset(&data->tx_fifo);
+	data->has_pending_tx_buffer = 0;
+	data->pending_tx_len = 0;
 	data->is_available = 1;
+	k_spin_unlock(&data->tx_lock, key);
+
 	usb_midi_availability_changed(1);
 
 	LOG_DBG("Instance %p", c_data);
@@ -442,7 +559,11 @@ void usb_midi_disable_cb(struct usbd_class_data *const c_data)
 	LOG_DBG("Instance %p", c_data);
 	struct usb_midi_data *data = usbd_class_get_private(c_data);
 
+	k_spinlock_key_t key = k_spin_lock(&data->tx_lock);
 	data->is_available = 0;
+	k_spin_unlock(&data->tx_lock, key);
+	tx_abort_pending(data);
+
 	usb_midi_availability_changed(0);
 }
 
