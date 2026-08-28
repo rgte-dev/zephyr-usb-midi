@@ -470,15 +470,12 @@ int usb_midi_request_cb(struct usbd_class_data *const c_data, struct net_buf *bu
 			read_pos += 4;
 		}
 
-		// free the current buffer...
-		usbd_ep_buf_free(uds_ctx, buf);
-
-		// ...and allocate and enqueue new one for receiving future data
-		struct net_buf *next_buf = usbd_ep_buf_alloc(c_data, usb_midi_bulk_out_ep_addr(c_data),
-							     USBD_MAX_BULK_MPS);
-		int ep_enqueue_result = usbd_ep_enqueue(c_data, next_buf);
+		// Reuse the current buffer for receiving future data.
+		net_buf_reset(buf);
+		int ep_enqueue_result = usbd_ep_enqueue(c_data, buf);
 		if (ep_enqueue_result != 0) {
 			LOG_WRN("usbd_ep_enqueue failed with error %d", ep_enqueue_result);
+			usbd_ep_buf_free(uds_ctx, buf);
 		}
 
 	} else {
@@ -544,12 +541,18 @@ void usb_midi_enable_cb(struct usbd_class_data *const c_data)
 	// Allocate buffer for receiving data
 	struct net_buf *rx_buf =
 		usbd_ep_buf_alloc(c_data, usb_midi_bulk_out_ep_addr(c_data), USBD_MAX_BULK_MPS);
+	if (rx_buf == NULL) {
+		LOG_ERR("Failed to allocate rx buf");
+		return;
+	}
+
 	// Enqueue the rx buffer. This signals to the stack that
 	// we're ready to receive data. If this is not done,
 	// nothing will be received.
 	int enqueue_result = usbd_ep_enqueue(c_data, rx_buf);
 	if (enqueue_result != 0) {
 		LOG_ERR("Failed to enqueue rx buf with error %d", enqueue_result);
+		usbd_ep_buf_free(c_data->uds_ctx, rx_buf);
 	}
 }
 
