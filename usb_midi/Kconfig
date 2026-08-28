@@ -36,7 +36,11 @@ config USB_MIDI_CALLBACKS_ON_SYSTEM_WORK_QUEUE
 
 config USB_MIDI_RX_FIFO_SIZE
   int "The size in bytes of the rx fifo. Must be a multiple of 4. Only used when USB_MIDI_CALLBACKS_ON_SYSTEM_WORK_QUEUE is enabled"
+	default 2048 if USBD_MAX_SPEED_HIGH
 	default 256
+	help
+	  USB MIDI event packets are queued here before the system workqueue parses
+	  them. High-speed bulk OUT packets can contain 512 bytes of USB MIDI events.
 
 #
 # Custom input jack names.
