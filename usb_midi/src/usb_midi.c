@@ -617,9 +617,10 @@ void usb_midi_disable_cb(struct usbd_class_data *const c_data)
 	k_spin_unlock(&data->tx_lock, key);
 	tx_abort_pending(data);
 
-	// Enable allocates a new one. Not closed: when usbd_disable() runs this on another thread, a
-	// packet completing right after the swap can still be held. After re-enable a SOF enqueues it
-	// next to the new one, so two buffers circulate from then on: harmless, one more from the pool.
+	// Free a held buffer, enable_cb allocates a new one. A small race is left open on purpose:
+	// when usbd_disable() runs this on another thread, a packet received just before can be held
+	// after the swap. After the next enable a SOF enqueues it next to the new buffer, so two RX
+	// buffers circulate. Harmless, it only uses one more buffer from the pool.
 	struct net_buf *held = atomic_ptr_clear(&data->held_rx_buf);
 	if (held != NULL) {
 		usbd_ep_buf_free(c_data->uds_ctx, held);
