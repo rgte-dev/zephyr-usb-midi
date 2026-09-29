@@ -1,5 +1,6 @@
 #include <zephyr/init.h>
 #include <zephyr/spinlock.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/usb/usbd.h>
 #include <zephyr/drivers/usb/udc.h>
@@ -89,6 +90,9 @@ struct usb_midi_data {
 	int has_pending_tx_buffer;
 	uint32_t pending_tx_len;
 	int is_available;
+	// the OUT buffer held back while rx_ready_cb says no, NULL while receiving. Taken by swap: usbd_disable() runs
+	// disable_cb on the caller's thread, which the USB stack thread's SOF can preempt
+	atomic_ptr_t held_rx_buf;
 	struct usb_midi_config* config;
 	const struct usb_desc_header **const fs_desc;
 #if USBD_SUPPORTS_HIGH_SPEED
@@ -472,6 +476,11 @@ int usb_midi_request_cb(struct usbd_class_data *const c_data, struct net_buf *bu
 
 		// Reuse the current buffer for receiving future data.
 		net_buf_reset(buf);
+		if (user_callbacks.rx_ready_cb && !user_callbacks.rx_ready_cb()) {
+			// enqueued again at a later SOF
+			atomic_ptr_set(&data->held_rx_buf, buf);
+			return 0;
+		}
 		int ep_enqueue_result = usbd_ep_enqueue(c_data, buf);
 		if (ep_enqueue_result != 0) {
 			LOG_WRN("usbd_ep_enqueue failed with error %d", ep_enqueue_result);
@@ -517,8 +526,32 @@ void usb_midi_resumed_cb(struct usbd_class_data *const c_data)
 }
 
 /** Start of Frame */
+// Runs at every SOF: 1 kHz, or 8 kHz on high-speed controllers that don't divide microframes. Keep the common case,
+// nothing held, to a single load.
+static void rx_resume_if_ready(struct usbd_class_data *const c_data)
+{
+	struct usb_midi_data *data = usbd_class_get_private(c_data);
+	if (atomic_ptr_get(&data->held_rx_buf) == NULL) {
+		return;
+	}
+	if (user_callbacks.rx_ready_cb && !user_callbacks.rx_ready_cb()) {
+		return;
+	}
+	struct net_buf *buf = atomic_ptr_clear(&data->held_rx_buf);
+	if (buf == NULL) {
+		// disable_cb took it since the load
+		return;
+	}
+	int enqueue_result = usbd_ep_enqueue(c_data, buf);
+	if (enqueue_result != 0) {
+		LOG_ERR("Failed to enqueue held rx buf with error %d", enqueue_result);
+		usbd_ep_buf_free(c_data->uds_ctx, buf);
+	}
+}
+
 void usb_midi_sof_cb(struct usbd_class_data *const c_data)
 {
+	rx_resume_if_ready(c_data);
 	enqueue_next_tx_buf(c_data);
 }
 
@@ -566,6 +599,14 @@ void usb_midi_disable_cb(struct usbd_class_data *const c_data)
 	data->is_available = 0;
 	k_spin_unlock(&data->tx_lock, key);
 	tx_abort_pending(data);
+
+	// Enable allocates a new one. Not closed: when usbd_disable() runs this on another thread, a packet completing
+	// right after the swap can still be held. After re-enable a SOF enqueues it next to the new one, so two buffers
+	// circulate from then on: harmless, one more from the pool.
+	struct net_buf *held = atomic_ptr_clear(&data->held_rx_buf);
+	if (held != NULL) {
+		usbd_ep_buf_free(c_data->uds_ctx, held);
+	}
 
 	usb_midi_availability_changed(0);
 }
@@ -665,6 +706,7 @@ void usb_midi_register_callbacks(struct usb_midi_cb_t *cb)
 	user_callbacks.sysex_start_cb = cb->sysex_start_cb;
 	user_callbacks.sysex_data_cb = cb->sysex_data_cb;
 	user_callbacks.sysex_end_cb = cb->sysex_end_cb;
+	user_callbacks.rx_ready_cb = cb->rx_ready_cb;
 
 	rx_parse_cb.message_cb = cb->midi_message_cb;
 	rx_parse_cb.sysex_start_cb = cb->sysex_start_cb;

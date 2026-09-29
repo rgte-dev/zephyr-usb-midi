@@ -5,6 +5,8 @@ config USB_DEVICE_MIDI
 	bool "USB MIDI device class driver"
 	depends on (USB_DEVICE_STACK || USB_DEVICE_STACK_NEXT)
   select RING_BUFFER if (USB_DEVICE_SOF || USB_DEVICE_STACK_NEXT)
+  # TX and a held RX buffer are both serviced at SOF
+  select UDC_ENABLE_SOF if USB_DEVICE_STACK_NEXT
 
 if USB_DEVICE_MIDI
 
