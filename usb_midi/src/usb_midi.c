@@ -90,8 +90,9 @@ struct usb_midi_data {
 	int has_pending_tx_buffer;
 	uint32_t pending_tx_len;
 	int is_available;
-	// the OUT buffer held back while rx_ready_cb says no, NULL while receiving. Taken by swap: usbd_disable() runs
-	// disable_cb on the caller's thread, which the USB stack thread's SOF can preempt
+	// the OUT buffer held back while rx_ready_cb says no, NULL while receiving. Taken by swap:
+	// usbd_disable() runs disable_cb on the caller's thread, which the USB stack thread's SOF
+	// can preempt
 	atomic_ptr_t held_rx_buf;
 	struct usb_midi_config* config;
 	const struct usb_desc_header **const fs_desc;
@@ -230,6 +231,22 @@ static void usb_midi_availability_work_cb(struct k_work *work)
 K_WORK_DEFINE(usb_midi_availability_work, usb_midi_availability_work_cb);
 
 #endif // CONFIG_USB_MIDI_CALLBACKS_ON_SYSTEM_WORK_QUEUE
+
+BUILD_ASSERT(!IS_ENABLED(CONFIG_USB_MIDI_CALLBACKS_ON_SYSTEM_WORK_QUEUE) ||
+		     CONFIG_USB_MIDI_RX_FIFO_SIZE >= USBD_MAX_BULK_MPS,
+	     "the rx fifo must fit a whole packet, or a held rx buffer is never enqueued again");
+
+// Whether another OUT packet can be taken. With the work queue it lands in rx_fifo first, so that
+// needs room too
+static bool rx_ready(void)
+{
+#ifdef CONFIG_USB_MIDI_CALLBACKS_ON_SYSTEM_WORK_QUEUE
+	if (ring_buf_space_get(&rx_fifo) < USBD_MAX_BULK_MPS) {
+		return false;
+	}
+#endif
+	return user_callbacks.rx_ready_cb == NULL || user_callbacks.rx_ready_cb();
+}
 
 static void usb_midi_availability_changed(int is_available)
 {
@@ -476,7 +493,7 @@ int usb_midi_request_cb(struct usbd_class_data *const c_data, struct net_buf *bu
 
 		// Reuse the current buffer for receiving future data.
 		net_buf_reset(buf);
-		if (user_callbacks.rx_ready_cb && !user_callbacks.rx_ready_cb()) {
+		if (!rx_ready()) {
 			// enqueued again at a later SOF
 			atomic_ptr_set(&data->held_rx_buf, buf);
 			return 0;
@@ -526,15 +543,15 @@ void usb_midi_resumed_cb(struct usbd_class_data *const c_data)
 }
 
 /** Start of Frame */
-// Runs at every SOF: 1 kHz, or 8 kHz on high-speed controllers that don't divide microframes. Keep the common case,
-// nothing held, to a single load.
+// Runs at every SOF: 1 kHz, or 8 kHz on high-speed controllers that don't divide microframes.
+// Keep the common case, nothing held, to a single load.
 static void rx_resume_if_ready(struct usbd_class_data *const c_data)
 {
 	struct usb_midi_data *data = usbd_class_get_private(c_data);
 	if (atomic_ptr_get(&data->held_rx_buf) == NULL) {
 		return;
 	}
-	if (user_callbacks.rx_ready_cb && !user_callbacks.rx_ready_cb()) {
+	if (!rx_ready()) {
 		return;
 	}
 	struct net_buf *buf = atomic_ptr_clear(&data->held_rx_buf);
@@ -600,9 +617,9 @@ void usb_midi_disable_cb(struct usbd_class_data *const c_data)
 	k_spin_unlock(&data->tx_lock, key);
 	tx_abort_pending(data);
 
-	// Enable allocates a new one. Not closed: when usbd_disable() runs this on another thread, a packet completing
-	// right after the swap can still be held. After re-enable a SOF enqueues it next to the new one, so two buffers
-	// circulate from then on: harmless, one more from the pool.
+	// Enable allocates a new one. Not closed: when usbd_disable() runs this on another thread, a
+	// packet completing right after the swap can still be held. After re-enable a SOF enqueues it
+	// next to the new one, so two buffers circulate from then on: harmless, one more from the pool.
 	struct net_buf *held = atomic_ptr_clear(&data->held_rx_buf);
 	if (held != NULL) {
 		usbd_ep_buf_free(c_data->uds_ctx, held);

@@ -25,11 +25,12 @@ typedef void (*usb_midi_sysex_start_cb_t)(uint8_t cable_num);
 typedef void (*usb_midi_sysex_data_cb_t)(uint8_t* data_bytes, uint8_t num_data_bytes, uint8_t cable_num);
 /** A function to call when a sysex message ends */
 typedef void (*usb_midi_sysex_end_cb_t)(uint8_t cable_num);
-/** A function to call after each received packet has been parsed, returning whether another packet fits. False holds
- * the OUT endpoint buffer, so the controller NAKs the host in hardware, and it is asked again at each SOF until it
- * returns true. Called from the USB stack thread, must be quick. Optional, NULL always accepts. Only the device_next
- * stack without CONFIG_USB_MIDI_CALLBACKS_ON_SYSTEM_WORK_QUEUE holds exactly: with the work queue the application
- * sees its data only after the module's rx fifo, the legacy stack ignores it. */
+/** A function to call after each received packet has been parsed, returning whether another
+ * packet fits. False holds the OUT endpoint buffer, so the controller NAKs the host in hardware,
+ * and it is asked again at each SOF until it returns true. Called from the USB stack thread, must
+ * be quick. Optional, NULL always accepts. With CONFIG_USB_MIDI_CALLBACKS_ON_SYSTEM_WORK_QUEUE up
+ * to CONFIG_USB_MIDI_RX_FIFO_SIZE / 4 already accepted events can still arrive after it returns
+ * false. The legacy stack ignores it. */
 typedef bool (*usb_midi_rx_ready_cb_t)(void);
 
 struct usb_midi_cb_t {
